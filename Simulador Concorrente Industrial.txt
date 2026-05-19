@@ -1,5 +1,4 @@
 Simulador Concorrente Industrial
-Realizado Por: Jorge André de Sousa Cardoso - pv28440
 
 #include <stdio.h>
 #include <stdlib.h>
