@@ -1,0 +1,299 @@
+Simulador Concorrente Industrial
+Realizado Por: Jorge André de Sousa Cardoso - pv28440
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+
+//ESTRUTURAS DE DADOS CONFIGURÁVEIS
+typedef struct { int id; } Componente;
+typedef struct { int id_produto; } Produto;
+
+//Parâmetros de Configuração Dinâmica
+int TAMANHO_BUFFER_A; 
+int TAMANHO_BUFFER_B; 
+int TOTAL_PRODUTOS_OBJETIVO;
+int NUM_PRODUTORES;
+int NUM_MONTADORES;
+int NUM_CONTROLADORES;
+
+//Buffers Circulares Dinâmicos
+Componente* buffer_A;
+int in_A = 0, out_A = 0, count_A = 0;
+
+Produto* buffer_B;
+int in_B = 0, out_B = 0, count_B = 0;
+
+//Primitivas de Sincronização (Mutexes e Variáveis de Condição)
+pthread_mutex_t mutex_A = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_B = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond_A_vazio = PTHREAD_COND_INITIALIZER;
+pthread_cond_t cond_A_cheio = PTHREAD_COND_INITIALIZER;
+pthread_cond_t cond_B_vazio = PTHREAD_COND_INITIALIZER;
+pthread_cond_t cond_B_cheio = PTHREAD_COND_INITIALIZER;
+
+//Variáveis Globais de Controlo
+int produtos_concluidos = 0;
+int producao_ativa = 1;
+
+//MÁQUINA DE ESTATÍSTICAS
+int esperas_produtores = 0;
+int esperas_montadores = 0;
+int esperas_controladores = 0;
+pthread_mutex_t mutex_estatisticas = PTHREAD_MUTEX_INITIALIZER;
+
+//FASE DE PRODUÇÃO DE COMPONENTES
+void* thread_produtor(void* arg) {
+    int id = *(int*)arg;
+    int sequencia = 1;
+
+    while (1) {
+        pthread_mutex_lock(&mutex_B);
+        if (!producao_ativa) {
+            pthread_mutex_unlock(&mutex_B);
+            break;
+        }
+        pthread_mutex_unlock(&mutex_B);
+
+        //Simulação de tempo real de fabrico (Aleatório entre 0.1s e 0.5s)
+        usleep((rand() % 400 + 100) * 1000); 
+        Componente c;
+        c.id = (id * 1000) + sequencia;
+
+        pthread_mutex_lock(&mutex_A);
+
+        //Registo da situação de espera
+        if (count_A == TAMANHO_BUFFER_A) {
+            printf("[Produtor %d] ESPERA: Buffer A cheio. A aguardar escoamento...\n", id);
+            pthread_mutex_lock(&mutex_estatisticas);
+            esperas_produtores++;
+            pthread_mutex_unlock(&mutex_estatisticas);
+        }
+        
+        while (count_A == TAMANHO_BUFFER_A && producao_ativa) {
+            pthread_cond_wait(&cond_A_vazio, &mutex_A);
+        }
+
+        if (!producao_ativa) {
+            pthread_mutex_unlock(&mutex_A);
+            break;
+        }
+
+        //Escrita no Buffer A
+        buffer_A[in_A] = c;
+        printf("[Produtor %d] Produção da componente: #%d colocada no Buffer A\n", id, c.id);
+        in_A = (in_A + 1) % TAMANHO_BUFFER_A;
+        count_A++;
+
+        pthread_cond_broadcast(&cond_A_cheio); //Acorda os montadores
+        pthread_mutex_unlock(&mutex_A);
+        sequencia++;
+    }
+    return NULL;
+}
+
+//FASE DE MONTAGEM
+void* thread_montador(void* arg) {
+    int id = *(int*)arg;
+
+    while (1) {
+        pthread_mutex_lock(&mutex_A);
+        
+        //Registo da situação de espera por falta de componentes (3 peças necessárias)
+        if (count_A < 3 && producao_ativa) {
+            printf("[Montador %d] ESPERA: Falta de componentes no Buffer A (Disponíveis: %d/3)\n", id, count_A);
+            pthread_mutex_lock(&mutex_estatisticas);
+            esperas_montadores++;
+            pthread_mutex_unlock(&mutex_estatisticas);
+        }
+
+        while (count_A < 3 && producao_ativa) {
+            pthread_cond_wait(&cond_A_cheio, &mutex_A);
+        }
+
+        pthread_mutex_lock(&mutex_B);
+        if (!producao_ativa) {
+            pthread_mutex_unlock(&mutex_B);
+            pthread_mutex_unlock(&mutex_A);
+            break;
+        }
+        pthread_mutex_unlock(&mutex_B);
+
+        //Início de Montagem (Consumo físico e atómico das 3 peças)
+        printf("[Montador %d] Início de montagem utilizando 3 componentes.\n", id);
+        int c1 = buffer_A[out_A].id; out_A = (out_A + 1) % TAMANHO_BUFFER_A;
+        int c2 = buffer_A[out_A].id; out_A = (out_A + 1) % TAMANHO_BUFFER_A;
+        int c3 = buffer_A[out_A].id; out_A = (out_A + 1) % TAMANHO_BUFFER_A;
+        count_A -= 3;
+
+        pthread_cond_broadcast(&cond_A_vazio); //Notifica os produtores
+        pthread_mutex_unlock(&mutex_A);
+
+        //Simulação do tempo físico de montagem
+        sleep(1); 
+        Produto novo_produto;
+        novo_produto.id_produto = c1 + c2 + c3;
+        printf("[Montador %d] Fim da montagem do Produto (ID: %d).\n", id, novo_produto.id_produto);
+
+        //Inserção no Buffer B (Produtos Montados)
+        pthread_mutex_lock(&mutex_B);
+        if (count_B == TAMANHO_BUFFER_B) {
+            printf("[Montador %d] ESPERA: Buffer B cheio. A aguardar pelo Controlador...\n", id);
+            pthread_mutex_lock(&mutex_estatisticas);
+            esperas_montadores++;
+            pthread_mutex_unlock(&mutex_estatisticas);
+        }
+
+        while (count_B == TAMANHO_BUFFER_B && producao_ativa) {
+            pthread_cond_wait(&cond_B_vazio, &mutex_B);
+        }
+
+        buffer_B[in_B] = novo_produto;
+        in_B = (in_B + 1) % TAMANHO_BUFFER_B;
+        count_B++;
+
+        pthread_cond_broadcast(&cond_B_cheio); //Sinaliza o controlador
+        pthread_mutex_unlock(&mutex_B);
+    }
+    return NULL;
+}
+
+//FASE DE CONTROLO DE QUALIDADE
+void* thread_controlador(void* arg) {
+    int id = *(int*)arg;
+
+    while (1) {
+        pthread_mutex_lock(&mutex_B);
+        
+        if (count_B == 0 && producao_ativa) {
+            printf("[Controlador %d] ESPERA: Sem produtos montados no Buffer B.\n", id);
+            pthread_mutex_lock(&mutex_estatisticas);
+            esperas_controladores++;
+            pthread_mutex_unlock(&mutex_estatisticas);
+        }
+
+        while (count_B == 0 && producao_ativa) {
+            pthread_cond_wait(&cond_B_cheio, &mutex_B);
+        }
+
+        //Entrada no controlo de qualidade
+        Produto p = buffer_B[out_B];
+        out_B = (out_B + 1) % TAMANHO_BUFFER_B;
+        count_B--;
+        
+        printf("[Controlador %d] Entrada no controlo de qualidade para o Produto (ID: %d).\n", id, p.id_produto);
+        pthread_cond_broadcast(&cond_B_vazio);
+        pthread_mutex_unlock(&mutex_B);
+
+        //Simulação do tempo de inspeção técnica
+        usleep(400000); 
+
+        pthread_mutex_lock(&mutex_B);
+        produtos_concluidos++;
+        printf("[Controlador %d] Saída do controlo de qualidade: Produto %d aprovado!\n", id, produtos_concluidos);
+
+        //Condição de Paragem Estrita do Guião
+        if (produtos_concluidos >= TOTAL_PRODUTOS_OBJETIVO) {
+            producao_ativa = 0;
+            //Desperta em broadcast todas as threads para termino imediato
+            pthread_cond_broadcast(&cond_A_vazio);
+            pthread_cond_broadcast(&cond_A_cheio);
+            pthread_cond_broadcast(&cond_B_vazio);
+            pthread_cond_broadcast(&cond_B_cheio);
+            pthread_mutex_unlock(&mutex_B);
+            break;
+        }
+        pthread_mutex_unlock(&mutex_B);
+    }
+    return NULL;
+}
+
+//GESTÃO E CONFIGURAÇÃO DO SISTEMA OPERATIVO
+int main() {
+    struct timespec tempo_inicial, tempo_final;
+    srand(time(NULL));
+
+    //Interface de Configuração Dinâmica
+    printf("=== CONFIGURAÇÃO DO SIMULADOR INDUSTRIAL ===\n");
+    printf("Tamanho do Buffer A (Componentes): "); scanf("%d", &TAMANHO_BUFFER_A);
+    printf("Tamanho do Buffer B (Produtos): ");    scanf("%d", &TAMANHO_BUFFER_B);
+    printf("Número de Produtos como Objetivo: ");    scanf("%d", &TOTAL_PRODUTOS_OBJETIVO);
+    printf("Quantidade de Threads Produtoras: ");  scanf("%d", &NUM_PRODUTORES);
+    printf("Quantidade de Threads Montadoras: ");  scanf("%d", &NUM_MONTADORES);
+    printf("Quantidade de Threads Controladoras: "); scanf("%d", &NUM_CONTROLADORES);
+
+    //Alocação dinâmica de memória para os Buffers Circulares
+    buffer_A = (Componente*)malloc(TAMANHO_BUFFER_A * sizeof(Componente));
+    buffer_B = (Produto*)malloc(TAMANHO_BUFFER_B * sizeof(Produto));
+
+    pthread_t t_prod[NUM_PRODUTORES], t_mont[NUM_MONTADORES], t_cont[NUM_CONTROLADORES];
+    int id_p[NUM_PRODUTORES], id_m[NUM_MONTADORES], id_c[NUM_CONTROLADORES];
+
+    //CONFIGURAÇÃO DA LINHA RÁPIDA
+    pthread_attr_t attr_rt;
+    struct sched_param param_rt;
+    pthread_attr_init(&attr_rt);
+    pthread_attr_setinheritsched(&attr_rt, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setschedpolicy(&attr_rt, SCHED_FIFO);
+    param_rt.sched_priority = 80; //Alta prioridade atribuída à linha rápida
+    pthread_attr_setschedparam(&attr_rt, &param_rt);
+
+    clock_gettime(CLOCK_MONOTONIC, &tempo_inicial);
+
+    //Criação das Threads da Pipeline
+    for(int i = 0; i < NUM_CONTROLADORES; i++) {
+        id_c[i] = i + 1;
+        pthread_create(&t_cont[i], NULL, thread_controlador, &id_c[i]);
+    }
+    for(int i = 0; i < NUM_MONTADORES; i++) {
+        id_m[i] = i + 1;
+        //O Montador 1 é mapeado na linha rápida
+        if(i == 0) {
+            pthread_create(&t_mont[i], &attr_rt, thread_montador, &id_m[i]);
+        } else {
+            pthread_create(&t_mont[i], NULL, thread_montador, &id_m[i]);
+        }
+    }
+    for(int i = 0; i < NUM_PRODUTORES; i++) {
+        id_p[i] = i + 1;
+        pthread_create(&t_prod[i], NULL, thread_produtor, &id_p[i]);
+    }
+
+    pthread_attr_destroy(&attr_rt);
+
+    //Aguarda o termino de todas as threads (Graceful Shutdown Real)
+    for(int i = 0; i < NUM_CONTROLADORES; i++) pthread_join(t_cont[i], NULL);
+    
+    //Alerta em broadcast secundário caso alguma thread ainda esteja em espera condicional
+    pthread_mutex_lock(&mutex_A); pthread_cond_broadcast(&cond_A_cheio); pthread_cond_broadcast(&cond_A_vazio); pthread_mutex_unlock(&mutex_A);
+    pthread_mutex_lock(&mutex_B); pthread_cond_broadcast(&cond_B_cheio); pthread_cond_broadcast(&cond_B_vazio); pthread_mutex_unlock(&mutex_B);
+
+    for(int i = 0; i < NUM_PRODUTORES; i++) pthread_join(t_prod[i], NULL);
+    for(int i = 0; i < NUM_MONTADORES; i++) pthread_join(t_mont[i], NULL);
+
+    clock_gettime(CLOCK_MONOTONIC, &tempo_final);
+    double tempo_total = (tempo_final.tv_sec - tempo_inicial.tv_sec) + (tempo_final.tv_nsec - tempo_inicial.tv_nsec) / 1e9;
+
+    //PAINEL DE ESTATÍSTICAS
+    printf("\n=======================================================\n");
+    printf("        RELATÓRIO DE MONITORIZAÇÃO CONCORRENTE\n");
+    printf("=======================================================\n");
+    printf("Tempo Total da Operação: %.4f segundos\n", tempo_total);
+    printf("Tempo Médio de Produção por Item: %.4f segundos\n", tempo_total / TOTAL_PRODUTOS_OBJETIVO);
+    printf("Rendimento Geral (Throughput): %.2f produtos/segundo\n", TOTAL_PRODUTOS_OBJETIVO / tempo_total);
+    printf("-------------------------------------------------------\n");
+    printf("NÚMERO DE SITUAÇÕES DE ESPERA REGISTADAS:\n");
+    printf(" -> Bloqueios de Produtores (Buffer A Cheio): %d\n", esperas_produtores);
+    printf(" -> Bloqueios de Montadores (Falta de Componentes/Buffer B Cheio): %d\n", esperas_montadores);
+    printf(" -> Bloqueios de Controladores (Buffer B Vazio): %d\n", esperas_controladores);
+    printf("=======================================================\n");
+
+    //Libertação dos recursos da heap e destruição de primitivas
+    free(buffer_A);
+    free(buffer_B);
+    pthread_cond_destroy(&cond_A_vazio); pthread_cond_destroy(&cond_A_cheio);
+    pthread_cond_destroy(&cond_B_vazio); pthread_cond_destroy(&cond_B_cheio);
+    return 0;
+}
